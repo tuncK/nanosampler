@@ -5,10 +5,7 @@
 
 from keras import backend
 from keras.callbacks import Callback, EarlyStopping, ModelCheckpoint, LambdaCallback
-from keras.layers import Dense, Dropout, Input, Masking
-from keras.models import Model
 from keras.optimizers import Adam
-from tensorflow.keras.utils import plot_model
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,129 +13,14 @@ import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
 import tensorflow as tf
+from tensorflow.keras.utils import plot_model
 import time
+
+from subsampling_MLP import *
 
 
 # Fix a np.random.seed for reproducibility in numpy processing
 np.random.seed(42)
-
-
-class filterInputs(tf.keras.constraints.Constraint):
-  """
-  Constrains weight tensors such that among the incoming edges, only 1 of them is 1, else 0.
-  This effectively selects only 1 of those nodes as input, filtering out the rest.
-  """
-
-  def __init__(self):
-    self.ref_value = 1
-
-  def __call__(self, w):
-    mean = tf.reduce_mean(w)
-    return w - mean + self.ref_value
-
-  def get_config(self):
-    return {'ref_value': self.ref_value}
-
-
-
-class SubsamplingLayer(tf.keras.layers.Layer):
-    def __init__(self, dim, num_measurements, **kwargs):
-        super().__init__(**kwargs)
-        self.w = tf.Variable(shape=(dim), initial_value=np.ones((dim)), trainable=True, dtype='float32', name='weights', constraint=tf.keras.constraints.unit_norm(axis=0))
-        self.num_measurements = num_measurements
-
-    def call(self, inputs):
-        top_k_vals = tf.math.top_k(self.w, k=self.num_measurements).values
-        threshold =  tf.math.reduce_min(top_k_vals)
-        
-        # Option 1: set unselected antibody targets to 0.       
-        masked = tf.where(self.w-threshold >= 0, inputs, 0)
-
-        # Option 2: mask unselected antibodies (i.e. -1)
-        #masked = tf.where(self.w-threshold >= 0, inputs, -1)
-        #masked = Masking(mask_value=-1)(masked)
-        
-        return masked
-
-
-# Tailor-made regulariser to heavily penalise measuring more and more proteins.
-# @tf.keras.utils.register_keras_serializable(package='Custom', name='l0')
-class L0Regularizer(tf.keras.regularizers.Regularizer):
-    def __init__(self, l0=0.0, steepness=1.0):
-        self.l0 = l0
-        self.steepness = steepness
-    
-    def __call__(self, w):
-        # In the ideal case, only 1 incoming edge is supposed to be 1, all others 0.
-        wp = tf.math.ceil(tf.math.sigmoid(w * self.steepness) - 0.5)
-        penalty = tf.cast(tf.math.reduce_sum(tf.math.count_nonzero(wp, axis=0) - 1), tf.float32)
-        return self.l0 * penalty
-        #return self.l0 * tf.math.reduce_sum(tf.math.abs( tf.math.reduce_sum(tf.cast(x>0.2, tf.float32), axis=1) - 1))
-
-    def get_config(self):
-        return {'l0': float(self.l0)}
-
-
-class constrain01(tf.keras.constraints.Constraint):
-    """
-    Constrains the weights of the subsampling layer so that the weights
-    are in [0,1] or {0,1}.
-    """
-    def __init__(self, steepness=1.0):
-        self.steepness = steepness
-
-    def __call__(self, w):
-        # return w
-        wp = tf.math.sigmoid(w * self.steepness)
-        return tf.math.ceil(wp-0.5)
-        #wp = tf.cast(tf.greater_equal(w, 0.0), tf.float32)
-        #return wp / (backend.epsilon() + tf.reduce_max(wp, axis=0, keepdims=True))
-
-
-def subsampling_classifier(dims, num_measurements, latent_act='relu', init='he_normal', dropout_rate=0.0):
-    # init='glorot_uniform' was worse in loss during testing
-    
-    """
-    Fully connected auto-encoder model, symmetric. SAE or DAE.
-
-    Parameters
-    ----------
-    dims : int array
-        List of number of units in each layer of encoder. dims[0] is input dim, dims[-1] is the hidden layer.
-        The decoder is symmetric with the encoder. So the total number of layers of the
-        auto-encoder is 2*len(dims)-1.
-
-    act : str
-        Activation function, if any, to put in the internal dense layers
-
-    Returns
-    ----------
-    (ae_model, encoder_model) : Model of the autoencoder and model of the encoder
-    """
-
-    # input layer
-    input_layer = Input(shape=(dims[0]), name='input')
-    x = input_layer
-
-    # Ignore all but num_measurements many proteins, i.e. mimic limited experimental sampling
-    # x = SubsamplingLayer(dims[0], num_measurements=num_measurements, name='target_selection')(x)
-
-    # Soft alternative to above
-    x = Dense(num_measurements, name='dense_0', kernel_constraint=constrain01())(x) 
-    # , kernel_regularizer=L0Regularizer(l0=0.1) )(x)
-
-    dense_layer_idx = 1
-    for layer_dim in dims[1:]:
-        x = Dense(layer_dim, activation=latent_act, kernel_initializer=init, name='dense_%d' % dense_layer_idx)(x)
-        x = Dropout(rate=dropout_rate, name='dropout_%d' % dense_layer_idx)(x)
-        dense_layer_idx+=1
-    
-    x = Dense(1, activation='sigmoid', kernel_initializer=init, name='dense_%d' % dense_layer_idx)(x)
-    
-    output_layer = x
-    model = tf.keras.Model(input_layer, output_layer)
-    model.summary()
-    return model
 
 
 class Modality(object):
@@ -164,7 +46,7 @@ class Modality(object):
         Seed for the number random generator. Defaults to 0.
     """
 
-    def __init__(self, Xfile, Yfile, clipnorm_lim=1, seed=0, max_training_duration=np.inf, **kwargs):
+    def __init__(self, Xfile, Yfile, clipnorm_lim=1, seed=0, max_training_duration=np.inf, num_measurements=3, **kwargs):
         self.t_start = time.time()
         self.Xfilename = str(Xfile)
         self.Yfilename = str(Yfile)      
@@ -181,6 +63,7 @@ class Modality(object):
         self.output_dir = './results/'
         os.makedirs(self.output_dir, exist_ok=True)
 
+        self.num_measurements = num_measurements
 
     def load_X_data(self, dtype=None):
         """
@@ -264,7 +147,7 @@ class Modality(object):
         latent_dims.insert(0, self.X_train.shape[1])
 
         # create classifier model
-        self.classifier = subsampling_classifier(dims=latent_dims, num_measurements=100, latent_act=act, dropout_rate=dropout_rate)
+        self.classifier = subsampling_classifier(dims=latent_dims, num_measurements=self.num_measurements, latent_act=act, dropout_rate=dropout_rate)
        
         # compile the model
         customised_adam = Adam(clipnorm=self.clipnorm_lim)
@@ -275,7 +158,8 @@ class Modality(object):
 
         if plot_progress:
             self.saveLossProgress()
-            plot_model(self.classifier, 'model.png', show_shapes=True)
+            plot_model(self.classifier, self.output_dir + '/model.png', show_shapes=True)
+            self.plot_filter_weights()
 
 
     def set_callbacks(self, patience, save_model):
@@ -313,13 +197,40 @@ class Modality(object):
         plt.plot(self.history.history['loss'])
         plt.plot(self.history.history['val_loss'])
 
-        plt.title('Autoencoder model loss')
+        plt.title('Model loss during training')
         plt.ylabel('Binary cross entropy')
         plt.xlabel('Epoch')
         plt.legend(['train', 'val.'], loc='upper right')
         plt.yscale('log')
         plt.tight_layout()
-        plt.savefig('loss_curves.png')
+        plt.savefig(self.output_dir + '/loss_curves.png')
+        plt.close()
+
+
+    # Obtain and plot the weights of the filtering layer.
+    # Ideally, this layer should map 20000 -> num_measurements
+    # Only one 1 per row, the rest 0.
+    def plot_filter_weights(self):
+        w = self.classifier.get_weight_paths()['target_selection.kernel'].numpy()
+        mask = SubsamplingLayer.get_topk_mask(w, self.num_measurements)
+
+        if w.ndim == 1:
+            #print(w)
+            print(mask)
+            w = w.reshape((1,w.shape[0]))
+        else:
+            y = w.sum(axis=0)
+            print(y)
+
+        plt.rcParams.update({'font.size': 14})
+        plt.imshow(w.transpose(), cmap='binary')
+        plt.colorbar(location='bottom')
+
+        plt.title('Filtering layer weights after training')
+        plt.ylabel('Latent layer')
+        plt.xlabel('Input layer')
+        plt.tight_layout()
+        plt.savefig(self.output_dir + '/filter_layer.png')
         plt.close()
 
 
@@ -376,7 +287,7 @@ def train_modality(Xfile, Yfile, gradient_threshold=1, latent_dims=[16,8], max_t
 
 
 if __name__ == '__main__':
-    dataset = 'gdac' # gdac or demo
+    dataset = 'demo'
     train_modality(Xfile='./input/%s_X.tsv' % dataset, Yfile='./input/%s_y.tsv' % dataset, latent_dims=[100, 10], dropout_rate=0.0, gradient_threshold=0.1)
 
 
